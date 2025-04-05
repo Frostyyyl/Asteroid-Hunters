@@ -1,7 +1,7 @@
 from time import sleep
 from colors import Colors
 from mpi4py import MPI
-from threading import Thread, Lock, Condition
+from threading import Thread, Lock, RLock, Condition
 from random import randint
 from enum import Enum
 
@@ -21,7 +21,7 @@ class State(Enum):
 
 
 class Message:
-    def __init__(self, timestamp: int, telepath: int):
+    def __init__(self, telepath: int, timestamp: int):
         self.timestamp = timestamp
         self.telepath = telepath
 
@@ -46,13 +46,31 @@ class Entity:
 
 
 class Observatory(Entity):
+    RANK = 0
+    ASTEROIDS_MIN = 1
+    ASTEROIDS_MAX = 3
+
     def __init__(self, comm: MPI.COMM_WORLD) -> None:
         super().__init__(comm)
 
     def run(self) -> None:
+        new_asteroids: int = 0
+
         while True:
-            sleep(2)
-            self.print('Just slept')
+            sleep(randint(3, self.SIZE))
+
+            new_asteroids = randint(
+                Observatory.ASTEROIDS_MIN, Observatory.ASTEROIDS_MAX
+            )
+            self.print(f'Found {new_asteroids} new asteroids, sending notice')
+
+            for rank in range(self.SIZE):
+                if rank != self.RANK:
+                    self.COMM.send(
+                        Asteroids_Info(new_asteroids),
+                        dest=rank,
+                        tag=Tag.OBSERVATORY.value,
+                    )
 
 
 class Telepath(Entity):
@@ -65,26 +83,31 @@ class Telepath(Entity):
 
         # Local time variables
         self.WORK_TIME = 3
-        self.SLEEP_TIME = randint(1, comm.Get_size())
+        self.SLEEP_TIME = randint(1, self.SIZE)
 
         # Variables used in threading
-        # NOTE: ack_count does not need a lock because of
-        # when each thread accesses it
         # NOTE: asteroids_count does not need a lock because only
         # messenger is ever modifying it
+        # NOTE: ack_count does not need a lock because of
+        # when each thread accesses it
         self.messenger = Thread(target=self._handle_communication, daemon=True)
-        self.lock_lamport_clock = Lock()
         self.lock_request_queue = Lock()
-        self.lock_served_asteroids = Lock()
+        self.lock_lamport_clock = Lock()
+        self.lock_destroyed_asteroids = Lock()
         self.has_all_ack = Condition()
+        self.is_first_in_queue = Condition()
+        self.has_any_asteroids = Condition()
 
         # Local variables
         self.request_queue: list[Request] = []
         self.lamport_clock = 0
         self.asteroids_count = 0
-        self.served_asteroids = 0
+        self.destroyed_asteroids = 0
         self.ack_count = 0
-        self.state = State.DEFAULT
+
+    def debug(self, text: str) -> None:
+        print(f'{self.COLOR}DEBUG: [{self.RANK}] {text}')
+        pass
 
     def _handle_communication(self) -> None:
         status = MPI.Status()
@@ -94,114 +117,169 @@ class Telepath(Entity):
                 source=MPI.ANY_SOURCE, tag=MPI.ANY_TAG, status=status
             )
 
-            if status.tag != Tag.OBSERVATORY:
+            if status.tag != Tag.OBSERVATORY.value:
                 with self.lock_lamport_clock:
                     self.lamport_clock = max(self.lamport_clock, data.timestamp) + 1
+                    self.debug(f'Updated Lamport\'s clock: {self.lamport_clock}')
 
-            match status.tag:
-                case Tag.REQ:
                     with self.lock_request_queue:
-                        self.request_queue.append(data)
-                        self.request_queue.sort(
-                            key=lambda x: (x.timestamp, x.applicant)
+                        for req in self.request_queue:
+                            if req.telepath == data.telepath:
+                                req.timestamp = self.lamport_clock
+                        self.request_queue.sort(key=lambda x: (x.timestamp))
+                        self.debug(
+                            f'Updated request queue: {[(r.telepath, r.timestamp) for r in self.request_queue]}'
                         )
 
-                    with self.lock_lamport_clock:
-                        self.COMM.send(
-                            Message(self.lamport_clock, self.RANK),
-                            dest=data.sender,
-                            tag=Tag.ACK,
-                        )
+            if status.tag == Tag.REQ.value:
+                self.debug(f'Received REQ from {data.telepath}')
+                with self.lock_request_queue:
+                    self.request_queue.append(Request(data.telepath, data.timestamp))
+                    self.request_queue.sort(key=lambda x: (x.timestamp))
+                    self.debug(
+                        f'Request queue: {[(r.telepath, r.timestamp) for r in self.request_queue]}'
+                    )
 
-                case Tag.ACK:
-                    self.ack_count += 1
-                    if self.ack_count == self.SIZE - 1:
+                with self.lock_lamport_clock:
+                    self.COMM.send(
+                        Message(self.RANK, self.lamport_clock),
+                        dest=data.telepath,
+                        tag=Tag.ACK.value,
+                    )
+                    self.debug(f'Sent ACK to {status.source}')
+
+            elif status.tag == Tag.ACK.value:
+                self.debug(f'Received ACK from {status.source}')
+                self.ack_count += 1
+                with self.has_all_ack:
+                    if self.ack_count == self.SIZE - 2:
                         self.has_all_ack.notify()
+                        self.debug('Notified has_all_ack')
 
-                case Tag.RELEASE:
-                    with self.lock_served_asteroids:
-                        self.served_asteroids += 1
+            elif status.tag == Tag.RELEASE.value:
+                self.debug(f'Received RELEASE from {data.telepath}')
+                with self.lock_destroyed_asteroids:
+                    self.destroyed_asteroids += 1
 
-                    with self.lock_request_queue:
-                        self.request_queue = [
-                            req
-                            for req in self.request_queue
-                            if req.applicant != data.sender
-                        ]
+                self._remove_from_request_queue(data.telepath)
+                self.debug(f'Removed {status.source} from queue')
+                with self.is_first_in_queue:
+                    self.is_first_in_queue.notify()
+                    self.debug('Notified is_first_in_queue')
 
-                case Tag.OBSERVATORY:
-                    self.asteroids_count += data.new_asteroids
+            elif status.tag == Tag.OBSERVATORY.value:
+                self.asteroids_count += data.new_asteroids
+                with self.has_any_asteroids:
+                    self.has_any_asteroids.notify()
+                self.debug(
+                    f'Added {data.new_asteroids} asteroids (total: {self.asteroids_count})'
+                )
 
-                case _:
-                    self.print(f'Received unknown message tag [{status.tag}]')
+            else:
+                self.print(
+                    f'Received unknown message tag [{status.tag}] from {status.source}'
+                )
 
     def _send_release(self) -> None:
         with self.lock_lamport_clock:
             self.lamport_clock += 1
 
             for rank in range(self.SIZE):
-                if rank != self.RANK:
+                if rank == self.RANK or rank == Observatory.RANK:
+                    continue
+                else:
                     self.COMM.send(
-                        Message(self.lamport_clock, self.RANK),
+                        Message(self.RANK, self.lamport_clock),
                         dest=rank,
-                        tag=Tag.RELEASE,
+                        tag=Tag.RELEASE.value,
                     )
 
-    def _send_request(self) -> None:
+    def _send_requests(self) -> None:
         with self.lock_lamport_clock:
             self.lamport_clock += 1
-            self.request_queue.append(Request(self.RANK, self.lamport_clock))
+
+            with self.lock_request_queue:
+                self.request_queue.append(Request(self.RANK, self.lamport_clock))
 
             for rank in range(self.SIZE):
-                if rank != self.RANK:
+                if rank == self.RANK or rank == Observatory.RANK:
+                    continue
+                else:
                     self.COMM.send(
-                        Message(self.lamport_clock, self.RANK), dest=rank, tag=Tag.REQ
+                        Message(self.RANK, self.lamport_clock),
+                        dest=rank,
+                        tag=Tag.REQ.value,
                     )
+
+    def _remove_from_request_queue(self, telepath: int) -> None:
+        with self.lock_request_queue:
+            self.request_queue = [
+                req for req in self.request_queue if req.telepath != telepath
+            ]
 
     def run(self) -> None:
         self.messenger.start()
+        state = State.DEFAULT
         just_rested = False
 
         while True:
-            match self.state:
-                case State.DEFAULT:
-                    if not just_rested and randint(1, 100) <= 50:
-                        self.state = State.IN_REST
-                    else:
-                        just_rested = False
-                        self._send_request()
-                        self.state = State.IN_REQUEST
+            if state == State.DEFAULT:
+                if not just_rested and randint(1, 100) <= 50:
+                    state = State.IN_REST
+                else:
+                    just_rested = False
+                    state = State.IN_REQUEST
 
-                case State.IN_REST:
-                    self.print('I\'m taking a break')
-                    just_rested = True
-                    sleep(self.SLEEP_TIME)
-                    self.state = State.DEFAULT
+            elif state == State.IN_REST:
+                self.print('Taking a break')
+                just_rested = True
+                sleep(self.SLEEP_TIME)
+                state = State.DEFAULT
 
-                case State.IN_REQUEST:
+            elif state == State.IN_REQUEST:
+
+                with self.has_all_ack:
+                    self._send_requests()
+
                     self.print('Waiting to be assigned an asteroid')
+                    self.has_all_ack.wait()  # Wait to be notified
+                    self.debug(f'Got all ACKs ({self.ack_count})')
 
-                    with self.has_all_ack:
-                        self.has_all_ack.wait()  # Wait to be notified
-                        self.state = State.IN_SECTION
+                    while True:
+                        with self.is_first_in_queue:
+                            with self.lock_request_queue:
+                                if self.request_queue[0].telepath == self.RANK:
+                                    self.debug('I\'m first in queue')
+                                    break
+                            self.debug('Waiting to be first in queue')
+                            self.is_first_in_queue.wait()
 
-                case State.IN_SECTION:
-                    self.print("Destroying an asteroid")
-                    with self.lock_served_asteroids:
-                        self.served_asteroids += 1
+                    state = State.IN_SECTION
 
-                    sleep(self.WORK_TIME)
-                    self._send_release()
-                    self.ack_count = 0
+            elif state == State.IN_SECTION:
+                while True:
+                    with self.has_any_asteroids:
+                        with self.lock_destroyed_asteroids:
+                            if self.asteroids_count > self.destroyed_asteroids:
+                                break
+                        self.debug(f'Waiting for an asteroid notify [{self.asteroids_count}/{self.destroyed_asteroids}]')
+                        self.has_any_asteroids.wait()
 
-                    with self.lock_request_queue:
-                        self.request_queue = [
-                            req
-                            for req in self.request_queue
-                            if req.applicant != self.RANK
-                        ]
-                    self.state = State.DEFAULT
+                self.print("Destroying an asteroid")
+                with self.lock_destroyed_asteroids:
+                    self.destroyed_asteroids += 1
+                    self.debug(f'Destroyed asteroids: {self.destroyed_asteroids}')
 
-                case _:
-                    self.print(f'Entered an incorrect state [{self.state}]')
-                    self.state = State.DEFAULT
+                sleep(self.WORK_TIME)
+
+                self.print('The asteroid was destroyed')
+
+                self._remove_from_request_queue(self.RANK)
+                self._send_release()
+                self.ack_count = 0
+
+                state = State.DEFAULT
+
+            else:
+                self.print(f'Entered an incorrect state [{state}]')
+                state = State.DEFAULT

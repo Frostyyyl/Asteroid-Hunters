@@ -4,7 +4,7 @@ from entities import Observatory, Telepath
 
 def main():
     comm = MPI.COMM_WORLD
-    if comm.Get_rank() == 1:
+    if comm.Get_rank() == Observatory.RANK:
         observatory = Observatory(comm)
         observatory.run()
     else:
