@@ -21,20 +21,17 @@ class State(Enum):
 
 
 class Message:
-    def __init__(self, timestamp, sender):
+    def __init__(self, timestamp: int, telepath: int):
         self.timestamp = timestamp
-        self.sender = sender
+        self.telepath = telepath
 
 
-class Observatorys_Notify:
-    def __init__(self, detected_asteroids):
-        self.detected_asteroids = detected_asteroids
+Request = Message
 
 
-class Request:
-    def __init__(self, applicant, timestamp):
-        self.applicant = applicant
-        self.timestamp = timestamp
+class Asteroids_Info:
+    def __init__(self, new_asteroids: int):
+        self.new_asteroids = new_asteroids
 
 
 class Entity:
@@ -44,12 +41,12 @@ class Entity:
         self.RANK = comm.Get_rank()
         self.COLOR = Colors.get_color(self.RANK)
 
-    def print(self, text) -> None:
+    def print(self, text: str) -> None:
         print(f'{self.COLOR}[{self.RANK}] {text}')
 
 
 class Observatory(Entity):
-    def __init__(self, comm):
+    def __init__(self, comm: MPI.COMM_WORLD) -> None:
         super().__init__(comm)
 
     def run(self) -> None:
@@ -62,9 +59,8 @@ class Telepath(Entity):
     # NOTE: Any and all variables shared between communication thread
     # (messenger) and main loop (run) must be protected by using
     # a Lock if using a read and assign operators (+=, -=, /=, *=).
-    # Not necessary only if just one side is ever writing
 
-    def __init__(self, comm) -> None:
+    def __init__(self, comm: MPI.COMM_WORLD) -> None:
         super().__init__(comm)
 
         # Local time variables
@@ -72,8 +68,14 @@ class Telepath(Entity):
         self.SLEEP_TIME = randint(1, comm.Get_size())
 
         # Variables used in threading
+        # NOTE: ack_count does not need a lock because of
+        # when each thread accesses it
+        # NOTE: asteroids_count does not need a lock because only
+        # messenger is ever modifying it
         self.messenger = Thread(target=self._handle_communication, daemon=True)
         self.lock_lamport_clock = Lock()
+        self.lock_request_queue = Lock()
+        self.lock_served_asteroids = Lock()
         self.has_all_ack = Condition()
 
         # Local variables
@@ -88,7 +90,7 @@ class Telepath(Entity):
         status = MPI.Status()
 
         while True:
-            data: Message | Observatorys_Notify = self.COMM.recv(
+            data: Message | Asteroids_Info = self.COMM.recv(
                 source=MPI.ANY_SOURCE, tag=MPI.ANY_TAG, status=status
             )
 
@@ -98,13 +100,18 @@ class Telepath(Entity):
 
             match status.tag:
                 case Tag.REQ:
-                    self.request_queue.append(Request(data.sender, data.timestamp))
-                    self.request_queue.sort(key=lambda x: (x.timestamp, x.applicant))
-                    self.COMM.send(
-                        Message(self.lamport_clock, self.RANK),
-                        dest=data.sender,
-                        tag=Tag.ACK,
-                    )
+                    with self.lock_request_queue:
+                        self.request_queue.append(data)
+                        self.request_queue.sort(
+                            key=lambda x: (x.timestamp, x.applicant)
+                        )
+
+                    with self.lock_lamport_clock:
+                        self.COMM.send(
+                            Message(self.lamport_clock, self.RANK),
+                            dest=data.sender,
+                            tag=Tag.ACK,
+                        )
 
                 case Tag.ACK:
                     self.ack_count += 1
@@ -112,17 +119,18 @@ class Telepath(Entity):
                         self.has_all_ack.notify()
 
                 case Tag.RELEASE:
-                    self.served_asteroids += 1
-                    self.request_queue = [
-                        req
-                        for req in self.request_queue
-                        if req.applicant != data.sender
-                    ]
-                    if self.is_requesting and self._can_enter_critical_section():
-                        self._enter_critical_section()
+                    with self.lock_served_asteroids:
+                        self.served_asteroids += 1
+
+                    with self.lock_request_queue:
+                        self.request_queue = [
+                            req
+                            for req in self.request_queue
+                            if req.applicant != data.sender
+                        ]
 
                 case Tag.OBSERVATORY:
-                    self.asteroids_count += data.detected_asteroids
+                    self.asteroids_count += data.new_asteroids
 
                 case _:
                     self.print(f'Received unknown message tag [{status.tag}]')
@@ -179,16 +187,19 @@ class Telepath(Entity):
 
                 case State.IN_SECTION:
                     self.print("Destroying an asteroid")
-                    self.served_asteroids += 1
-                    sleep(self.WORK_TIME)
+                    with self.lock_served_asteroids:
+                        self.served_asteroids += 1
 
+                    sleep(self.WORK_TIME)
                     self._send_release()
                     self.ack_count = 0
 
-                    # Remove our own request from the queue
-                    self.request_queue = [
-                        req for req in self.request_queue if req.applicant != self.RANK
-                    ]
+                    with self.lock_request_queue:
+                        self.request_queue = [
+                            req
+                            for req in self.request_queue
+                            if req.applicant != self.RANK
+                        ]
                     self.state = State.DEFAULT
 
                 case _:
