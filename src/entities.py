@@ -99,19 +99,21 @@ class Telepath(Entity):
 
         # Variables used in threading
         self.messenger = Thread(target=self._handle_communication, daemon=True)
-        self.lock_request_queue = Lock()
-        self.lock_lamport_clock = Lock()
-        self.lock_destroyed_asteroids = Lock()
         self.has_every_ack = Condition()
+        self.has_pair = Condition()
         self.might_be_first_in_queue = Condition()
         self.received_asteroids = Condition()
+        self.lock_request_queue = Lock()
+        self.lock_lamport_clock = Lock()
 
         # Local variables
         self.request_queue: list[Request] = []
         self.lamport_clock = 0
-        self.destroyed_asteroids = 0
+        self.destroyed_asteroids = 0  # NOTE: Use with lock_request_queue
         self.asteroids_count = 0
         self.ack_count = 1
+        self.pair_has_notified = False
+        self.assigned_asteroid = -1
 
     def run(self) -> None:
         self.messenger.start()
@@ -138,40 +140,52 @@ class Telepath(Entity):
                 # be aquired before sending requests
                 with self.has_every_ack:
                     self.debug("Sending requests")
-                    self._send_requests()
+                    self._send_requests_and_add_to_queue()
 
                     self.print("Waiting to be assigned an asteroid")
                     self.has_every_ack.wait()  # Wait to be notified
                     self.debug(f"Got all ACKs ({self.ack_count})")
 
+                # Notify or be notified by your pair # TODO: Finish this segment
+                with self.lock_request_queue:
+                    for i in range(len(self.request_queue)):
+                        if self.request_queue[i].telepath == self.RANK:
+                            if i % 2 == 0:
+                                # self._notify_pair(self.request_queue[i - 1].telepath)
+                                pass
+                            else:
+                                while True:
+                                    with self.has_pair:
+                                        if self.pair_has_notified:
+                                            break
+                                        self.has_pair.wait()
+
                 # Stop from advancing unless first in queue
-                while True:
-                    with self.might_be_first_in_queue:
-                        # Check if first in queue
-                        with self.lock_request_queue:
-                            if self.request_queue[0].telepath == self.RANK:
-                                self.debug("I'm first in queue")
-                                break
-                        self.debug("Waiting to be first in queue")
-                        self.might_be_first_in_queue.wait()  # Wait to be notified
+                # while True:
+                #     with self.might_be_first_in_queue:
+                #         # Check if first in queue
+                #         with self.lock_request_queue:
+                #             if self.request_queue[0].telepath == self.RANK:
+                #                 self.debug("I'm first in queue")
+                #                 break
+                #         self.debug("Waiting to be first in queue")
+                #         self.might_be_first_in_queue.wait()  # Wait to be notified
                 state = State.IN_SECTION
 
             elif state == State.IN_SECTION:
-                # Stop from advancing unless an asteroid is available
-                while True:
-                    with self.received_asteroids:
-                        # Check if an asteroid is available
-                        with self.lock_destroyed_asteroids:
-                            if self.asteroids_count > self.destroyed_asteroids:
-                                break
-                        self.debug(
-                            f"Waiting for an asteroid to be available [{self.destroyed_asteroids}/{self.asteroids_count}]"
-                        )
-                        self.received_asteroids.wait()
+                # Stop from advancing unless an asteroid is available # TODO: Change this segment
+                # while True:
+                #     with self.received_asteroids:
+                #         # Check if an asteroid is available
+                #         with self.lock_destroyed_asteroids:
+                #             if self.asteroids_count > self.destroyed_asteroids:
+                #                 break
+                #         self.debug(
+                #             f"Waiting for an asteroid to be available [{self.destroyed_asteroids}/{self.asteroids_count}]"
+                #         )
+                #         self.received_asteroids.wait()
 
-                with self.lock_destroyed_asteroids:
-                    self.destroyed_asteroids += 1
-                    self.print(f"Destroying the asteroid [{self.destroyed_asteroids}]")
+                self.print(f"Destroying the asteroid [{self.assigned_asteroid}]")
 
                 sleep(self.WORK_TIME)  # Simulate work
 
@@ -227,8 +241,6 @@ class Telepath(Entity):
 
             elif status.tag == Tag.RELEASE.value:
                 self.debug(f"Received RELEASE from {status.source}")
-                with self.lock_destroyed_asteroids:
-                    self.destroyed_asteroids += 1
 
                 self._remove_from_queue(status.source)
                 self.debug(f"Removed {status.source} from queue")
@@ -265,7 +277,7 @@ class Telepath(Entity):
                         tag=Tag.RELEASE.value,
                     )
 
-    def _send_requests(self) -> None:
+    def _send_requests_and_add_to_queue(self) -> None:
         with self.lock_lamport_clock:
             self.lamport_clock += 1
 
@@ -291,7 +303,12 @@ class Telepath(Entity):
             )
 
     def _remove_from_queue(self, telepath: int) -> None:
+        """
+        Removes a request from the queue and increases the number of
+        destroyed asteroids
+        """
         with self.lock_request_queue:
+            self.destroyed_asteroids += 1
             self.request_queue = [
                 req for req in self.request_queue if req.telepath != telepath
             ]
